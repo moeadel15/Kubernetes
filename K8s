@@ -1,0 +1,518 @@
+---
+- name: Install CRIO and Kubernetes on RHEL 
+  hosts: all
+  # vars_files:
+  #   - .vars.yml
+  become: yes
+  tasks:
+#remove swap space as per kube doc  Disabling swap is necessary because Kubernetes' scheduler needs to understand and manage the memory available on a machine
+#and swap space can interfere with this process
+    
+
+    - name: Update sshd_config
+      lineinfile:
+        path: /etc/ssh/sshd_config
+        regexp: '^LogLevel '
+        state: present
+        line: 'LogLevel QUIET'
+      notify:
+        - restart sshd
+    
+    - name: Update ssh_config
+      lineinfile:
+        path: /etc/ssh/ssh_config
+        line: 'LogLevel QUIET'
+        insertafter: EOF
+
+    - name: Disable swap
+      command: swapoff -a
+      ignore_errors: yes
+
+    - name: Check if /etc/fstab contains 'swap'
+      command: grep -q 'swap' /etc/fstab
+      register: grep_swap
+      changed_when: false
+      failed_when: false
+      check_mode: no
+
+    - name: Remove any line that has 'swap' in it
+      command: sed -i '/swap/d' /etc/fstab #command provided by Bob
+      when: grep_swap.rc == 0
+      notify:
+        - Reload systemd daemon
+
+    - name: Add br_netfilter module
+      modprobe:
+       name: br_netfilter
+       state: present
+
+    - name: Add overlay module
+      modprobe:
+       name: overlay
+       state: present
+
+#translating "cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf overlay
+#br_netfilter
+#EOF" to a task #
+    - name: Making sure overlay and br_netfilter modules are loaded at boot
+      copy:
+         dest: /etc/modules-load.d/k8s.conf
+         content: |
+           overlay
+           br_netfilter
+         owner: root
+         group: root
+         mode: '0644'
+
+    - name: Kubernetes network config
+      copy:
+         dest: /etc/sysctl.d/k8s.conf
+         content: |
+           net.bridge.bridge-nf-call-iptables = 1 
+           net.bridge.bridge-nf-call-ip6tables = 1 
+           net.ipv4.ip_forward = 1
+         owner: root
+         group: root
+         mode: '0644'
+      notify:
+        - Reload sysctl
+#IS there is a need for "echo 1 > /proc/sys/net/ipv4/ip_forward" ? <<<<<<<<
+    - name: Enable IP forwarding
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        state: present
+        reload: yes
+
+#    # - name: Update all packages
+#     #  dnf:
+#      #   name: "*"
+#       #  state: latest
+   #ChatGPT generated ############# Start #########
+    - name: Set variables for Cri-o version and OS
+      set_fact:
+        cri_o_version: "1.26"
+        os_version: "CentOS_8"
+
+    - name: Download and add the libcontainers stable repo
+      get_url:
+        url: "https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/{{ os_version }}/devel:kubic:libcontainers:stable.repo"
+        dest: "/etc/yum.repos.d/devel:kubic:libcontainers:stable.repo"
+        mode: '0644'
+
+    - name: Download and add the Cri-o version specific repo
+      get_url:
+        url: "https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable:cri-o:{{ cri_o_version }}/{{ os_version }}/devel:kubic:libcontainers:stable:cri-o:{{ cri_o_version }}.repo"
+        dest: "/etc/yum.repos.d/devel:kubic:libcontainers:stable:cri-o:{{ cri_o_version }}.repo"
+        mode: '0644'
+
+    - name: Install Cri-o
+      yum:
+        name: cri-o
+        state: present
+
+    - name: Start and enable CRI-O
+      systemd:
+        name: crio
+        enabled: yes
+        state: started    
+                     ############ END ##########
+   
+
+    # - name: Add Kubernetes repository
+    #   copy:
+    #     dest: /etc/yum.repos.d/kubernetes.repo
+    #     content: |
+    #       [kubernetes]
+    #       name=Kubernetes
+    #       baseurl=https://packages.cloud.google.com/yum/repos/kubernetes-el7-$basearch
+    #       enabled=1
+    #       gpgcheck=1
+    #       repo_gpgcheck=1
+    #       gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
+    #       exclude=kubelet kubeadm kubectl
+
+    - name: Add Kubernetes repository
+      copy:
+        dest: /etc/yum.repos.d/kubernetes.repo
+        content: |
+          [kubernetes]
+          name=Kubernetes
+          baseurl=https://pkgs.k8s.io/core:/stable:/v1.30/rpm/
+          enabled=1
+          gpgcheck=1
+          repo_gpgcheck=1
+          gpgkey=https://pkgs.k8s.io/core:/stable:/v1.30/rpm/repodata/repomd.xml.key
+          exclude=kubelet kubeadm kubectl cri-tools kubernetes-cni
+
+##is there is a need for "sudo setenforce 0" below command/task changes Selinux to permissive <<<<<<        
+#sudo sed -i 's/^SELINUX=enforcing$/SELINUX=permissive/' /etc/selinux/config
+    - name: Disable SELinux
+      selinux:
+        state: permissive
+        policy: targeted
+
+   
+#sudo yum install -y kubelet kubeadm kubectl --disableexcludes=kubernetes
+#sudo systemctl enable --now kubelet << is is called in Enable kubelet handlr  
+#systemctl restart crio <<is is called in Restart crio handler
+    - name: Install kubelet, kubeadm, and kubectl
+      command: "yum install -y kubelet kubeadm kubectl --disableexcludes=kubernetes" #due to the fact --disableexcludes is here w can't use dnf module as it will retun an error 
+                                                                                     #because "exclude=kubelet kubeadm kubectl" is defined in  kubernetes.repo
+      notify: 
+        - Reload systemd daemon
+        - Enable kubelet
+        - Restart crio
+
+  handlers:
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable kubelet
+      systemd:
+        name: kubelet
+        enabled: yes
+        state: started
+
+    - name: Reload sysctl
+      command: sysctl --system
+
+    - name: Restart crio
+      systemd:
+        name: crio
+        state: restarted
+
+    - name: restart sshd
+      service:
+        name: sshd
+        state: restarted
+    
+- name: Intialize K8s on master
+  hosts: Master
+  # vars_files:
+  #   - .vars.yml
+  tasks:
+    - name: include config vars from user
+      include_vars:
+        file: "{{ varsfile }}"
+
+    - name: Initialize the Kubernetes cluster using kubeadm
+      command: >
+        kubeadm init
+        --pod-network-cidr 10.244.0.0/16
+        --apiserver-advertise-address={{ master_node_ip }}
+      register: kubeadm_init
+      failed_when: "'[ERROR]' in kubeadm_init.stderr"
+
+    - name: Create .kube directory
+      file:
+        path: $HOME/.kube
+        state: directory
+        mode: 0755 
+
+    - name: Get user ID
+      command: id -u
+      register: user_id
+      changed_when: false
+
+    - name: Get group ID
+      command: id -g
+      register: user_gid
+      changed_when: false
+
+    - name: Copy admin kubeconfig to user's home directory
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: "{{ ansible_env.HOME }}/.kube/config"
+        remote_src: yes
+        owner: "{{ user_id.stdout }}"
+        group: "{{ user_gid.stdout }}"
+        mode: 0644
+
+    - name: Create a new token and retrieve the join command
+      command: kubeadm token create --print-join-command
+      register: join_command_output
+      changed_when: false
+      tags: 
+        - create_token
+
+    - name: Set join command as a fact
+      set_fact:
+        k8s_join_command: "{{ join_command_output.stdout }}"
+      tags: 
+        - set_fact
+
+    - name: Join the node to the cluster
+      command: "{{ k8s_join_command }}"
+      loop: "{{ groups['Workers'] }}"
+      delegate_to: "{{ item }}"
+      tags: 
+        - join_cluster
+
+    - name: Pre-CSI installation 
+      command: "{{ item }}"
+      loop:
+       - /usr/lpp/mmfs/gui/cli/initgui
+       #- /usr/lpp/mmfs/gui/cli/mkusergrp CsiAdmin --role csiadminnd2
+       - /usr/lpp/mmfs/gui/cli/mkuser csiadmin -p adminuser -g CsiAdmin   
+       - /usr/lpp/mmfs/bin/mmchfs {{ fs_name |default('fs1')}} -Q yes 
+       - /usr/lpp/mmfs/bin/mmchconfig controlSetxattrImmutableSELinux=yes
+       - /usr/lpp/mmfs/bin/mmlsfs {{ fs_name |default('fs1') }} --filesetdf -Q --perfileset-quota
+       - /usr/lpp/mmfs/bin/mmchconfig enforceFilesetQuotaOnRoot=yes
+       - /usr/lpp/mmfs/bin/mmchfs {{ fs_name |default('fs1')}} --filesetdf
+      delegate_to: localhost
+      tags:
+       - precsi
+    - name: get nodes ips from /etc/hosts
+      shell: "mmlscluster | grep 'fyre' | awk '{print $2}' | grep -v 'UID\\|cluster\\|-1.fyre\\|-mgr.fyre'"  
+      register: nodes
+      ignore_errors: yes
+      run_once: true
+      throttle: 1
+
+    # - name: add nodes to scale config
+    #   command: "{{ installer_path }}spectrumscale node add {{ item }} -n -a -p"
+    #   with_items:
+    #     - "{{ nodes.stdout_lines }}"
+    #   run_once: true
+    #   throttle: 1
+
+    - name: Label worker nodes
+      command: kubectl label node {{ item }} scale=true --overwrite=true
+      # loop: "{{ groups['Workers'] }}"
+      with_items:
+        - "{{ nodes.stdout_lines }}"
+      delegate_to: "{{ groups['Master'][0] }}"
+      tags:
+       - label
+
+    - name: Update subnet in CNI configuration
+      replace:
+        path: "/etc/cni/net.d/100-crio-bridge.conflist" 
+        regexp: '"subnet": "10.85.0.0/16"'
+        replace: '"subnet": "10.244.0.0/16"'
+      delegate_to: "{{item}}"
+      loop: "{{ groups['Master'] + groups['Workers'] }}"
+
+    - name: Restart Crio
+      service:
+        name: crio
+        state: restarted   
+      delegate_to: "{{item}}"
+      loop: "{{ groups['Master'] + groups['Workers'] }}"   
+   
+#############Under Testing############################
+
+    # - name: Install community.kubernetes Ansible collection
+    #   command: ansible-galaxy collection install community.kubernetes
+    #   delegate_to: localhost
+
+
+    # - name: Ensure openshift Python package is installed
+    #   ansible.builtin.pip:
+    #    name: openshift
+    #    state: present
+    #   tags:
+    #   - openshift 
+
+    # - name: Download VolumeSnapshotClasses CRD YAML
+    #   get_url:
+    #    url: https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/release-6.2/client/config/crd/snapshot.storage.k8s.io_volumesnapshotclasses.yaml
+    #    dest: "/tmp/snapshot.storage.k8s.io_volumesnapshotclasses.yaml"
+    #   tags:
+    #   - down
+
+    # - name: Install VolumeSnapshotClasses CRD
+    #   k8s:
+    #     state: present
+    #     src: "/tmp/snapshot.storage.k8s.io_volumesnapshotclasses.yaml"
+    #   tags:
+    #   - crd1
+    
+
+    # - name: Install VolumeSnapshotContents CRD
+    #   k8s:
+    #     state: present
+    #     src: https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/release-6.2/client/config/crd/snapshot.storage.k8s.io_volumesnapshotcontents.yaml
+    #   tags:
+    #   - crd2 
+
+    # - name: Install VolumeSnapshots CRD
+    #   k8s:
+    #     state: present
+    #     src: https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/release-6.2/client/config/crd/snapshot.storage.k8s.io_volumesnapshots.yaml
+
+    # - name: Get Snapshot Ctr
+    #   k8s:
+    #     state: present
+    #     src: https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/release-6.2/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml
+
+    # - name: Install Snapshot Ctr
+    #   k8s:
+    #     state: present
+    #     src: https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/release-6.2/deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml    
+    
+    # - name: Create a k8s namespace for Scale
+    #   k8s:
+    #     name: ibm-spectrum-scale-csi-driver
+    #     api_version: v1
+    #     kind: Namespace
+    #     state: present
+
+    # - name: Download ibm-spectrum-scale-csi-operator.yaml
+    #   get_url:
+    #     url: https://raw.githubusercontent.com/IBM/ibm-spectrum-scale-csi/v2.9.0/generated/installer/ibm-spectrum-scale-csi-operator.yaml
+    #     dest: /root/ibm-spectrum-scale-csi-operator.yaml    
+
+   #########Testing####
+
+    - name: Applying VolumeSnapshots and controllers
+      command: "{{ item }}"
+      loop:
+       - kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/release-6.2/client/config/crd/snapshot.storage.k8s.io_volumesnapshotclasses.yaml
+       - kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/release-6.2/client/config/crd/snapshot.storage.k8s.io_volumesnapshotcontents.yaml
+       - kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/release-6.2/client/config/crd/snapshot.storage.k8s.io_volumesnapshots.yaml 
+       - kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/release-6.2/deploy/kubernetes/snapshot-controller/rbac-snapshot-controller.yaml 
+       - kubectl apply -f https://raw.githubusercontent.com/kubernetes-csi/external-snapshotter/release-6.2/deploy/kubernetes/snapshot-controller/setup-snapshot-controller.yaml  
+
+    - name: Create CSI namespace
+      command: kubectl create namespace ibm-spectrum-scale-csi-driver  
+
+    - name: Download operator manifest for CSI 
+      get_url:
+       url: https://raw.githubusercontent.com/IBM/ibm-spectrum-scale-csi/v2.9.0/generated/installer/ibm-spectrum-scale-csi-operator.yaml
+       dest: "/tmp/ibm-spectrum-scale-csi-operator.yaml"    
+
+
+    - name: Applying the operator manifest 
+      command: kubectl create -f /tmp/ibm-spectrum-scale-csi-operator.yaml   
+
+    - name: Installing flannel plugin 
+      command: kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml   
+
+    - name: Deploying Pod
+      command: kubectl get pod,deployment -n ibm-spectrum-scale-csi-driver    
+
+
+    - name: Create a secret with IBM Spectrum Scale GUI servers credentials
+      command: "{{ item }}"
+      loop:
+       - kubectl create secret generic guisecret --from-literal=username=csiadmin --from-literal=password=adminuser -n ibm-spectrum-scale-csi-driver  
+       - kubectl label secret guisecret product=ibm-spectrum-scale-csi -n ibm-spectrum-scale-csi-driver
+       - kubectl create secret generic remoteguisecret --from-literal=username=csiadmin --from-literal=password=adminuser -n ibm-spectrum-scale-csi-driver
+       - kubectl label secret remoteguisecret product=ibm-spectrum-scale-csi -n ibm-spectrum-scale-csi-driver
+
+    - name: Download operator manifest for CSI 
+      get_url:
+       url: https://raw.githubusercontent.com/IBM/ibm-spectrum-scale-csi/v2.9.0/operator/config/samples/csiscaleoperators.csi.ibm.com_cr.yaml
+       dest: "/tmp/csiscaleoperators.csi.ibm.com_cr.yaml"
+     
+    
+
+    # - name: Replace <Primary Cluster ID> using sed
+    #   command:
+    #     cmd: "sed -i 's/id: \"<Primary Cluster ID>\"/id: \"{{ primary_cluster_id }}\"/' /tmp/csiscaleoperators.csi.ibm.com_cr.yaml"
+
+    # - name: Set Secret1
+    #   lineinfile:
+    #     path: /tmp/csiscaleoperators.csi.ibm.com_cr.yaml
+    #     regexp: '^\s+secrets: "secret1"'
+    #     line: '      secrets: "guisecret" '
+
+    # - name: Set  Primary Filesystem 
+    #   lineinfile:
+    #     path: /tmp/csiscaleoperators.csi.ibm.com_cr.yaml
+    #     regexp: '^\s+primaryFs: "< Primary Filesystem >"'
+    #     line: '        primaryFs: "{{ fs_name | default("fs1") }}"'
+    
+
+    # - name: Replace < IP/Hostname of a GUI node of primary cluster >
+    #   lineinfile:
+    #     path: /tmp/csiscaleoperators.csi.ibm.com_cr.yaml
+    #     regexp: '^\s+- guiHost: "< IP/Hostname of a GUI node of primary cluster >"'
+    #     line: '      - guiHost: "{{Your_GUI_Node_IP}}"'
+
+    # - name: Uncomment and replace < Cluster ID >
+    #   command:
+    #     cmd: "sed -i '/#    - id: \"< Cluster ID >/s/^#//;s/< Cluster ID >/{{ secondary_cluster_id }}/' /tmp/csiscaleoperators.csi.ibm.com_cr.yaml"
+
+    #     #    - id: "< Cluster ID >"
+
+    # - name: Uncomment and replace < Secret for Cluster >
+    #   command:
+    #     cmd: "sed -i '/#      secrets: \"< Secret for Cluster >/s/^#//;s/< Secret for Cluster >/remoteguisecret/' /tmp/csiscaleoperators.csi.ibm.com_cr.yaml"
+
+    
+    # - name: Uncomment and replace < IP/Hostname of a GUI node of the cluster >
+    #   command:
+    #    cmd: >
+    #     sed -i 's/#\s*-\s*guiHost:\s*"< IP\/Hostname of a GUI node of the cluster >"/    - guiHost: "{{ secondary_gui_host }}"/' /tmp/csiscaleoperators.csi.ibm.com_cr.yaml
+    
+    # - name: Update YAML configuration
+    #   blockinfile:
+    #     path: /tmp/csiscaleoperators.csi.ibm.com_cr.yaml  # Replace with the actual path of your YAML file
+    #     marker: "# {mark} ANSIBLE MANAGED BLOCK"
+    #     block: |
+    #       - id: "{{secondary_cluster_id}}"
+    #         secrets: "remoteguisecret"
+    #         secureSslMode: false
+    #         restApi:
+    #         - guiHost: "{{secondary_gui_host}}"
+    #     insertafter: "# In the case we have multiple clusters, specify their configuration below."
+    #     backup: yes  # Creates a backup file with a .bak extension
+
+    
+
+
+    - name: Uncomment ID lines in the YAML file
+      lineinfile:
+        path: /tmp/csiscaleoperators.csi.ibm.com_cr.yaml
+        regexp: '^\s*#(\s*- id:.*)$'
+        line: '\1'
+        backrefs: yes
+      
+
+    - name: Uncomment Secret lines in the YAML file
+      lineinfile:
+        path: /tmp/csiscaleoperators.csi.ibm.com_cr.yaml
+        regexp: '^\s*#(\s*secrets:.*)$'
+        line: '\1'
+        backrefs: yes
+      
+
+    - name: Uncomment API lines in the YAML file
+      lineinfile:
+        path: /tmp/csiscaleoperators.csi.ibm.com_cr.yaml
+        regexp: '^\s*#(\s*restApi:.*)$'
+        line: '\1'
+        backrefs: yes
+      
+
+    - name: Uncomment GUI lines in the YAML file
+      lineinfile:
+        path: /tmp/csiscaleoperators.csi.ibm.com_cr.yaml
+        regexp: '^\s*#(\s*- guiHost:.*)$'
+        line: '\1'
+        backrefs: yes
+      
+
+    # - name: Applying CSI operator 
+    #   command: kubectl apply -f /tmp/csiscaleoperators.csi.ibm.com_cr.yaml
+
+    # - name: Getting pods State 
+    #   command: kubectl get pods -n ibm-spectrum-scale-csi-driver
+
+    # - name: Checking
+    #   command: kubectl get cso -oyaml -n ibm-spectrum-scale-csi-driver
+    # - name: Set values in the YAML file
+    #   yedit:
+    #     src: /tmp/csiscaleoperators.csi.ibm.com_cr.yaml
+    #     edits:
+    #       - key: "[0].id"  # Assuming the target is the first item in a list
+    #         value: "YourClusterID"
+    #       - key: "[0].secrets"
+    #         value: "YourSecretForCluster"
+    #       - key: "[0].restApi[0].guiHost"
+    #         value: "YourGuiHostIP"
+
